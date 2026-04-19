@@ -23,6 +23,7 @@ const providerName = process.env.PI_LLAMA_SWAP_PROVIDER ?? "llama-cpp";
 const baseUrl = process.env.PI_LLAMA_SWAP_BASE_URL ?? "http://127.0.0.1:8080/v1";
 const apiKey = process.env.PI_LLAMA_SWAP_API_KEY ?? "none";
 const defaultContextWindow = Number(process.env.PI_LLAMA_SWAP_DEFAULT_CTX ?? "128000");
+const isListModelsCommand = process.argv.includes("--list-models");
 
 let isApplyingModelRefresh = false;
 
@@ -96,8 +97,9 @@ async function syncProviderModels(pi: ExtensionAPI): Promise<{ modelIds: string[
 		return { modelIds: [], contextByModel: new Map() };
 	}
 
-	const swapRoot = getLlamaSwapRoot(baseUrl);
-	const contextByModel = await fetchContextByModel(swapRoot).catch(() => new Map<string, number>());
+	const contextByModel = isListModelsCommand
+		? new Map<string, number>()
+		: await fetchContextByModel(getLlamaSwapRoot(baseUrl)).catch(() => new Map<string, number>());
 
 	pi.registerProvider(providerName, {
 		baseUrl,
