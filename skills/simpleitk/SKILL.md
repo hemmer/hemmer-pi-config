@@ -147,16 +147,6 @@ Rule:
 - OO → complex workflows
 
 ---
-## Plotting
-
-When plotting axial, coronal, sagittal slices with matplotlib, care is needed to get flips/orientation as expected. Easiest way is to reformat to LPI: 
-
-```
-sitk_to_plot = sitk.DICOMOrient(vol_sitk, "LPI")
-np_to_plot = sitk.GetArrayViewFromImage(sitk_to_plot)
-```
-
----
 
 ## Common Mistakes
 
@@ -165,6 +155,7 @@ np_to_plot = sitk.GetArrayViewFromImage(sitk_to_plot)
 - Wrong transform direction
 - Linear interpolation on labels
 - Comparing images in voxel space
+- Images appear upside-down when plotted in matplotlib
 
 ---
 
