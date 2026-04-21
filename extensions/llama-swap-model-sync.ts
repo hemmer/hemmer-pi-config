@@ -17,7 +17,10 @@ interface LlamaCppPropsResponse {
 	default_generation_settings?: {
 		n_ctx?: number;
 	};
+	modalities?: unknown;
 }
+
+type ModelInput = "text" | "image";
 
 const providerName = process.env.PI_LLAMA_SWAP_PROVIDER ?? "llama-cpp";
 const baseUrl = process.env.PI_LLAMA_SWAP_BASE_URL ?? "http://127.0.0.1:8080/v1";
@@ -39,6 +42,31 @@ function getLlamaSwapRoot(url: string): string {
 function sameModel(a: Model<any> | undefined, b: Model<any> | undefined): boolean {
 	if (!a || !b) return false;
 	return a.provider === b.provider && a.id === b.id;
+}
+
+function sameInputs(a: Array<string> | undefined, b: Array<string> | undefined): boolean {
+	if (!a || !b) return false;
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i += 1) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+function modelSupportsVision(model: Model<any> | undefined): boolean {
+	if (!model) return false;
+	const inputs = Array.isArray(model.input) ? model.input : [];
+	return inputs.includes("image");
+}
+
+function updateVisionStatus(ctx: any, model?: Model<any>): void {
+	const current = model ?? ctx.model;
+	if (!current || current.provider !== providerName) {
+		ctx.ui.setStatus("llama-swap-vision", undefined);
+		return;
+	}
+	const text = modelSupportsVision(current) ? "text-and-vision" : "text-only";
+	ctx.ui.setStatus("llama-swap-vision", ctx.ui.theme.fg("dim", text));
 }
 
 async function fetchJson<T>(url: string, timeoutMs = 5000): Promise<T> {
@@ -64,13 +92,40 @@ async function fetchModelIds(url: string): Promise<string[]> {
 	return [...new Set(ids)].sort();
 }
 
+function parseInputsFromModalities(modalities: unknown): ModelInput[] {
+	const values: string[] = [];
+
+	if (typeof modalities === "string") {
+		values.push(modalities);
+	} else if (Array.isArray(modalities)) {
+		for (const value of modalities) {
+			if (typeof value === "string") values.push(value);
+		}
+	} else if (modalities && typeof modalities === "object") {
+		for (const key of Object.keys(modalities as Record<string, unknown>)) {
+			values.push(key);
+		}
+	}
+
+	const normalized = new Set(values.map((value) => value.trim().toLowerCase()));
+	const inputs: ModelInput[] = ["text"];
+	if (normalized.has("vision") || normalized.has("image") || normalized.has("images")) {
+		inputs.push("image");
+	}
+
+	return inputs;
+}
+
 function sanitizeContextWindow(value: number | undefined): number | undefined {
 	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
 	return Math.floor(value);
 }
 
-async function fetchContextByModel(swapRootUrl: string): Promise<Map<string, number>> {
-	const map = new Map<string, number>();
+async function fetchPropsByModel(
+	swapRootUrl: string,
+): Promise<{ contextByModel: Map<string, number>; inputByModel: Map<string, ModelInput[]> }> {
+	const contextByModel = new Map<string, number>();
+	const inputByModel = new Map<string, ModelInput[]>();
 	const running = await fetchJson<LlamaSwapRunningResponse>(`${swapRootUrl}/running`);
 
 	for (const entry of running.running ?? []) {
@@ -81,25 +136,31 @@ async function fetchContextByModel(swapRootUrl: string): Promise<Map<string, num
 		try {
 			const props = await fetchJson<LlamaCppPropsResponse>(`${normalizeBaseUrl(proxy)}/props`, 3000);
 			const nCtx = sanitizeContextWindow(props.default_generation_settings?.n_ctx);
-			if (nCtx) map.set(modelId, nCtx);
+			if (nCtx) contextByModel.set(modelId, nCtx);
+			inputByModel.set(modelId, parseInputsFromModalities(props.modalities));
 		} catch {
 			// Best effort only. Ignore per-model failures and keep defaults.
 		}
 	}
 
-	return map;
+	return { contextByModel, inputByModel };
 }
 
-async function syncProviderModels(pi: ExtensionAPI): Promise<{ modelIds: string[]; contextByModel: Map<string, number> }> {
+async function syncProviderModels(
+	pi: ExtensionAPI,
+): Promise<{ modelIds: string[]; contextByModel: Map<string, number>; inputByModel: Map<string, ModelInput[]> }> {
 	const modelIds = await fetchModelIds(baseUrl);
 	if (modelIds.length === 0) {
 		console.warn(`[llama-swap-model-sync] No models returned from ${baseUrl}/models`);
-		return { modelIds: [], contextByModel: new Map() };
+		return { modelIds: [], contextByModel: new Map(), inputByModel: new Map() };
 	}
 
-	const contextByModel = isListModelsCommand
-		? new Map<string, number>()
-		: await fetchContextByModel(getLlamaSwapRoot(baseUrl)).catch(() => new Map<string, number>());
+	const { contextByModel, inputByModel } = isListModelsCommand
+		? { contextByModel: new Map<string, number>(), inputByModel: new Map<string, ModelInput[]>() }
+		: await fetchPropsByModel(getLlamaSwapRoot(baseUrl)).catch(() => ({
+				contextByModel: new Map<string, number>(),
+				inputByModel: new Map<string, ModelInput[]>(),
+		  }));
 
 	pi.registerProvider(providerName, {
 		baseUrl,
@@ -109,7 +170,7 @@ async function syncProviderModels(pi: ExtensionAPI): Promise<{ modelIds: string[
 			id,
 			name: id,
 			reasoning: false,
-			input: ["text"],
+			input: inputByModel.get(id) ?? ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: contextByModel.get(id) ?? defaultContextWindow,
 			maxTokens: 16384,
@@ -121,11 +182,12 @@ async function syncProviderModels(pi: ExtensionAPI): Promise<{ modelIds: string[
 	});
 
 	const withCtx = modelIds.filter((id) => contextByModel.has(id)).length;
+	const withVision = modelIds.filter((id) => (inputByModel.get(id) ?? ["text"]).includes("image")).length;
 	console.log(
-		`[llama-swap-model-sync] Registered ${modelIds.length} model(s) for ${providerName} (${withCtx} with detected n_ctx)`,
+		`[llama-swap-model-sync] Registered ${modelIds.length} model(s) for ${providerName} (${withCtx} with detected n_ctx, ${withVision} with vision)`,
 	);
 
-	return { modelIds, contextByModel };
+	return { modelIds, contextByModel, inputByModel };
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -136,9 +198,16 @@ export default async function (pi: ExtensionAPI) {
 		console.warn(`[llama-swap-model-sync] Failed initial sync from ${baseUrl}: ${message}`);
 	}
 
+	pi.on("session_start", async (_event, ctx) => {
+		updateVisionStatus(ctx);
+	});
+
 	pi.on("model_select", async (event, ctx) => {
 		if (isApplyingModelRefresh) return;
-		if (event.model.provider !== providerName) return;
+		if (event.model.provider !== providerName) {
+			updateVisionStatus(ctx, event.model);
+			return;
+		}
 
 		try {
 			isApplyingModelRefresh = true;
@@ -146,12 +215,21 @@ export default async function (pi: ExtensionAPI) {
 
 			const refreshed = ctx.modelRegistry.find(providerName, event.model.id);
 			if (!refreshed) return;
-			if (refreshed.contextWindow === event.model.contextWindow) return;
+			if (
+				refreshed.contextWindow === event.model.contextWindow &&
+				sameInputs(refreshed.input as string[] | undefined, event.model.input as string[] | undefined)
+			)
+			{
+				updateVisionStatus(ctx, refreshed);
+				return;
+			}
 			if (sameModel(event.model, refreshed)) {
 				await pi.setModel(refreshed);
 			}
+			updateVisionStatus(ctx, refreshed);
 		} catch {
 			// Keep current model metadata on transient sync failures.
+			updateVisionStatus(ctx, event.model);
 		} finally {
 			isApplyingModelRefresh = false;
 		}
@@ -162,20 +240,30 @@ export default async function (pi: ExtensionAPI) {
 		if (ctx.model?.provider !== providerName) return;
 		if ((event.message as { role?: string }).role !== "assistant") return;
 
+		let current: Model<any> | undefined;
 		try {
 			isApplyingModelRefresh = true;
-			const current = ctx.model;
+			current = ctx.model;
 			await syncProviderModels(pi);
 
 			if (!current) return;
 			const refreshed = ctx.modelRegistry.find(providerName, current.id);
 			if (!refreshed) return;
-			if (refreshed.contextWindow === current.contextWindow) return;
+			if (
+				refreshed.contextWindow === current.contextWindow &&
+				sameInputs(refreshed.input as string[] | undefined, current.input as string[] | undefined)
+			)
+			{
+				updateVisionStatus(ctx, refreshed);
+				return;
+			}
 			if (sameModel(current, refreshed)) {
 				await pi.setModel(refreshed);
 			}
+			updateVisionStatus(ctx, refreshed);
 		} catch {
 			// Best effort only.
+			updateVisionStatus(ctx, current);
 		} finally {
 			isApplyingModelRefresh = false;
 		}
