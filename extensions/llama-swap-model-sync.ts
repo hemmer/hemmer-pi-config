@@ -166,16 +166,29 @@ async function fetchPropsByModel(
 		readyCount += 1;
 
 		const modelStartedAt = Date.now();
-		logDiagnostic(`Fetching props for ${modelId} via ${proxy}/props`);
+		const upstreamUrl = `${normalizeBaseUrl(swapRootUrl)}/upstream/${modelId}/props`;
+		const proxyUrl = `${normalizeBaseUrl(proxy)}/props`;
+		logDiagnostic(`Fetching props for ${modelId} via ${upstreamUrl} (fallback ${proxyUrl})`);
 
 		try {
-			const props = await fetchJson<LlamaCppPropsResponse>(`${normalizeBaseUrl(proxy)}/props`, propsTimeoutMs);
+			let props: LlamaCppPropsResponse;
+			let usedUrl = upstreamUrl;
+			try {
+				props = await fetchJson<LlamaCppPropsResponse>(upstreamUrl, propsTimeoutMs);
+			} catch (upstreamError) {
+				usedUrl = proxyUrl;
+				logDiagnostic(
+					`Upstream props failed for ${modelId} (${upstreamUrl}): ${upstreamError instanceof Error ? `${upstreamError.name}: ${upstreamError.message}` : String(upstreamError)}; trying proxy`,
+				);
+				props = await fetchJson<LlamaCppPropsResponse>(proxyUrl, propsTimeoutMs);
+			}
+
 			const nCtx = sanitizeContextWindow(props.default_generation_settings?.n_ctx);
 			if (nCtx) contextByModel.set(modelId, nCtx);
 			inputByModel.set(modelId, parseInputsFromProps(props));
 			propsSuccessCount += 1;
 			logDiagnostic(
-				`Props for ${modelId} in ${Date.now() - modelStartedAt}ms: n_ctx=${nCtx ?? "<missing>"}, inputs=${inputByModel.get(modelId)?.join(",") ?? "<missing>"}`,
+				`Props for ${modelId} in ${Date.now() - modelStartedAt}ms via ${usedUrl}: n_ctx=${nCtx ?? "<missing>"}, inputs=${inputByModel.get(modelId)?.join(",") ?? "<missing>"}`,
 			);
 		} catch (error) {
 			propsErrorCount += 1;
