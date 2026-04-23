@@ -18,6 +18,10 @@ interface LlamaCppPropsResponse {
 		n_ctx?: number;
 	};
 	modalities?: unknown;
+	capabilities?: unknown;
+	input?: unknown;
+	vision?: unknown;
+	is_multimodal?: unknown;
 }
 
 type ModelInput = "text" | "image";
@@ -26,6 +30,10 @@ const providerName = process.env.PI_LLAMA_SWAP_PROVIDER ?? "llama-cpp";
 const baseUrl = process.env.PI_LLAMA_SWAP_BASE_URL ?? "http://127.0.0.1:8080/v1";
 const apiKey = process.env.PI_LLAMA_SWAP_API_KEY ?? "none";
 const defaultContextWindow = Number(process.env.PI_LLAMA_SWAP_DEFAULT_CTX ?? "128000");
+const diagnosticsEnabled = process.env.PI_LLAMA_SWAP_DIAGNOSTICS === "1";
+const modelsTimeoutMs = Number(process.env.PI_LLAMA_SWAP_MODELS_TIMEOUT_MS ?? "5000");
+const runningTimeoutMs = Number(process.env.PI_LLAMA_SWAP_RUNNING_TIMEOUT_MS ?? "5000");
+const propsTimeoutMs = Number(process.env.PI_LLAMA_SWAP_PROPS_TIMEOUT_MS ?? "3000");
 const isListModelsCommand = process.argv.includes("--list-models");
 
 let isApplyingModelRefresh = false;
@@ -51,6 +59,10 @@ function sameInputs(a: Array<string> | undefined, b: Array<string> | undefined):
 		if (a[i] !== b[i]) return false;
 	}
 	return true;
+}
+
+function logDiagnostic(message: string): void {
+	if (diagnosticsEnabled) console.log(`[llama-swap-model-sync][diag] ${message}`);
 }
 
 function modelSupportsVision(model: Model<any> | undefined): boolean {
@@ -87,33 +99,44 @@ async function fetchJson<T>(url: string, timeoutMs = 5000): Promise<T> {
 }
 
 async function fetchModelIds(url: string): Promise<string[]> {
-	const payload = await fetchJson<OpenAIModelList>(`${normalizeBaseUrl(url)}/models`);
+	const payload = await fetchJson<OpenAIModelList>(`${normalizeBaseUrl(url)}/models`, modelsTimeoutMs);
 	const ids = (payload.data ?? []).map((m) => m.id?.trim()).filter((id): id is string => !!id);
 	return [...new Set(ids)].sort();
 }
 
-function parseInputsFromModalities(modalities: unknown): ModelInput[] {
-	const values: string[] = [];
+function parseInputsFromProps(props: LlamaCppPropsResponse): ModelInput[] {
+	const inputs = new Set<ModelInput>(["text"]);
+	const candidates: unknown[] = [props.modalities, props.capabilities, props.input, props.vision];
 
-	if (typeof modalities === "string") {
-		values.push(modalities);
-	} else if (Array.isArray(modalities)) {
-		for (const value of modalities) {
-			if (typeof value === "string") values.push(value);
+	for (const candidate of candidates) {
+		const values: string[] = [];
+		if (typeof candidate === "string") {
+			values.push(candidate);
+		} else if (Array.isArray(candidate)) {
+			for (const value of candidate) {
+				if (typeof value === "string") values.push(value);
+			}
+		} else if (candidate && typeof candidate === "object") {
+			for (const key of Object.keys(candidate as Record<string, unknown>)) {
+				values.push(key);
+			}
 		}
-	} else if (modalities && typeof modalities === "object") {
-		for (const key of Object.keys(modalities as Record<string, unknown>)) {
-			values.push(key);
+
+		const normalized = new Set(values.map((value) => value.trim().toLowerCase()));
+		if (
+			normalized.has("vision") ||
+			normalized.has("image") ||
+			normalized.has("images") ||
+			normalized.has("multimodal") ||
+			normalized.has("multimodal-input")
+		) {
+			inputs.add("image");
 		}
 	}
 
-	const normalized = new Set(values.map((value) => value.trim().toLowerCase()));
-	const inputs: ModelInput[] = ["text"];
-	if (normalized.has("vision") || normalized.has("image") || normalized.has("images")) {
-		inputs.push("image");
-	}
+	if (props.vision === true || props.is_multimodal === true) inputs.add("image");
 
-	return inputs;
+	return [...inputs];
 }
 
 function sanitizeContextWindow(value: number | undefined): number | undefined {
@@ -126,22 +149,51 @@ async function fetchPropsByModel(
 ): Promise<{ contextByModel: Map<string, number>; inputByModel: Map<string, ModelInput[]> }> {
 	const contextByModel = new Map<string, number>();
 	const inputByModel = new Map<string, ModelInput[]>();
-	const running = await fetchJson<LlamaSwapRunningResponse>(`${swapRootUrl}/running`);
+	const startedAt = Date.now();
+	const running = await fetchJson<LlamaSwapRunningResponse>(`${swapRootUrl}/running`, runningTimeoutMs);
+	const runningModels = running.running ?? [];
+	logDiagnostic(`Fetched /running from ${swapRootUrl} (${runningModels.length} entry/entries)`);
 
-	for (const entry of running.running ?? []) {
+	let readyCount = 0;
+	let propsSuccessCount = 0;
+	let propsTimeoutCount = 0;
+	let propsErrorCount = 0;
+
+	for (const entry of runningModels) {
 		const modelId = entry.model?.trim();
 		const proxy = entry.proxy?.trim();
 		if (!modelId || !proxy || entry.state !== "ready") continue;
+		readyCount += 1;
+
+		const modelStartedAt = Date.now();
+		logDiagnostic(`Fetching props for ${modelId} via ${proxy}/props`);
 
 		try {
-			const props = await fetchJson<LlamaCppPropsResponse>(`${normalizeBaseUrl(proxy)}/props`, 3000);
+			const props = await fetchJson<LlamaCppPropsResponse>(`${normalizeBaseUrl(proxy)}/props`, propsTimeoutMs);
 			const nCtx = sanitizeContextWindow(props.default_generation_settings?.n_ctx);
 			if (nCtx) contextByModel.set(modelId, nCtx);
-			inputByModel.set(modelId, parseInputsFromModalities(props.modalities));
-		} catch {
-			// Best effort only. Ignore per-model failures and keep defaults.
+			inputByModel.set(modelId, parseInputsFromProps(props));
+			propsSuccessCount += 1;
+			logDiagnostic(
+				`Props for ${modelId} in ${Date.now() - modelStartedAt}ms: n_ctx=${nCtx ?? "<missing>"}, inputs=${inputByModel.get(modelId)?.join(",") ?? "<missing>"}`,
+			);
+		} catch (error) {
+			propsErrorCount += 1;
+			const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+			if (error instanceof Error && error.name === "AbortError") {
+				propsTimeoutCount += 1;
+				console.warn(
+					`[llama-swap-model-sync] Timed out fetching props for ${modelId} after ${propsTimeoutMs}ms (${proxy}/props)`,
+				);
+			} else {
+				console.warn(`[llama-swap-model-sync] Failed fetching props for ${modelId} (${proxy}/props): ${message}`);
+			}
 		}
 	}
+
+	console.log(
+		`[llama-swap-model-sync] /running scan completed in ${Date.now() - startedAt}ms: ${readyCount} ready, ${propsSuccessCount} props ok, ${propsTimeoutCount} timeouts, ${propsErrorCount} errors`,
+	);
 
 	return { contextByModel, inputByModel };
 }
@@ -161,6 +213,12 @@ async function syncProviderModels(
 				contextByModel: new Map<string, number>(),
 				inputByModel: new Map<string, ModelInput[]>(),
 		  }));
+
+	if (diagnosticsEnabled) {
+		for (const id of modelIds) {
+			logDiagnostic(`Model ${id}: context=${contextByModel.get(id) ?? defaultContextWindow}, inputs=${(inputByModel.get(id) ?? ["text"]).join(",")}`);
+		}
+	}
 
 	pi.registerProvider(providerName, {
 		baseUrl,
